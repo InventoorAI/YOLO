@@ -1,21 +1,27 @@
-from fastapi import FastAPI, WebSocket, File, UploadFile
+from fastapi import FastAPI, WebSocket, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import numpy as np
 from PIL import Image
 import io
 import base64
-
 from ultralytics import YOLO
 import cv2
+from llamaapi import LlamaAPI
+from langchain_experimental.llms import ChatLlamaAPI
+from langchain.chains import create_tagging_chain
+from pydantic import BaseModel
+import json
+
+
+# Replace 'Your_API_Token' with your actual API token
+llama = LlamaAPI("LL-tlqRy5T6FtUz31itUFHjEhGKukfekKl8hyBp4CCxUEYexVLI1rH08p6M4ZwlaOuA")
 
 # Load a model
-model = YOLO('./best_s.pt')  # pretrained YOLOv8n model
+model = YOLO('./bestv3.pt')  # pretrained YOLOv8n model
 
 def get_x(target, frame):
-    frame = cv2.resize(frame, (480, 640), interpolation=cv2.INTER_AREA)
-
-    results = model(frame, show=False)
+    results = model(frame, show=True)
 
     boxes = results[0].boxes.xyxy.tolist()
     classes = results[0].boxes.cls.tolist()
@@ -25,6 +31,7 @@ def get_x(target, frame):
     found = False
     mx = 0
 
+
     # Iterate through the results
     for box, cls, conf in zip(boxes, classes, confidences):
         x1, y1, x2, y2 = map(int, box)
@@ -32,21 +39,19 @@ def get_x(target, frame):
         detected_class = int(cls)
         name = results[0].names[detected_class]
 
-        if (confidence < 0.6):
+        if (confidence < 0.5):
             continue
             
-        if (name == target and x2-x1 > mx):
+        if (name == target and (x2-x1) > mx):
             found = True
             x = (x1 + x2) // 2
             mx = x2-x1
 
-    x = 240 - x
+    x = x - frame.shape[0] // 2
     return x, found
 
 def count_objects(frame):
-    frame = cv2.resize(frame, (480, 640), interpolation=cv2.INTER_AREA)
-
-    results = model(frame, verbose=False, show=False)
+    results = model(frame, verbose=True, show=False)
 
     boxes = results[0].boxes.xyxy.tolist()
     classes = results[0].boxes.cls.tolist()
@@ -77,9 +82,9 @@ def count_objects(frame):
 
         # Define the font, font scale, and color for the label
         font = cv2.FONT_HERSHEY_SIMPLEX
-        font_scale = 0.5
+        font_scale = 3
         label_color = (0, 0, 255)  # White color
-        label_thickness = 1
+        label_thickness = 3
 
         # Add the label to the image
         cv2.putText(frame, label, label_position, font, font_scale, label_color, label_thickness, cv2.LINE_AA)
@@ -128,13 +133,20 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     while True:
         try:
-            data = await websocket.receive_bytes()
-            nparr = np.frombuffer(data, np.uint8)
-            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            data = await websocket.receive_text()
+            data = json.loads(data)
+            b64 = data['image']
+            name = data['name']
+
+            image_bytes = base64.b64decode(b64)
+
+            image_array = np.frombuffer(image_bytes, dtype=np.uint8)
+
+            # Decode the image data using OpenCV
+            img = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
+
             # Process the image (e.g., show it, save it, etc.)
-            # cv2.imshow('Received Image', img)
-            # cv2.waitKey(1)
-            x, found = get_x("blue-ball", img)
+            x, found = get_x(name, img)
             await websocket.send_text(f"{x}, {found}")
         except Exception as e:
             print(f"Connection closed: {e}")
@@ -169,6 +181,58 @@ async def count(file: UploadFile = File(...)):
 @app.get("/")
 async def hello_world():
     return "Hello World"
+
+class Prompt(BaseModel):
+    prompt: str
+
+@app.post("/parse")
+async def parse(body: Prompt):
+    model = ChatLlamaAPI(client=llama)
+
+    schema = {
+        "properties": {
+            "from": {
+                "type": "string",
+                "required": True,
+                "enum": ["Site A", "Site B"],
+                "description": "The location of the item."
+            },
+            "to": {
+                "type": "string",
+                "required": True,
+                "enum": ["Site A", "Site B"],
+                "description": "The destination of the item."
+            },
+            "item": {
+                "type": "string",
+                "required": True,
+                "enum": ["Box 1", "Box 2"],
+                "description": "The name of the item."
+            },
+            "valid": {
+                "type": "boolean",
+                "required": True,
+                "description": "Is only true if the prompt is a command to move an item from one site to another. Otherwise, false."
+            }
+        }
+    }
+
+    try:
+        chain = create_tagging_chain(schema, model)
+        out = chain.invoke(body.prompt)
+        print(out)
+        out = out['text']
+
+        if "valid" not in out:
+            out['valid'] = False
+    
+        if len(out.keys()) < 4:
+            out['valid'] = False
+        
+        return out
+    except:
+        raise HTTPException(status_code=404, detail="Invalid Command")
+
 
 
 if __name__ == "__main__":
